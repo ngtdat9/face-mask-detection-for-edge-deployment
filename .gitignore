@@ -1,6 +1,10 @@
 # Generated dataset splits (rebuild with: python src/prepare_data.py)
 data/
 
+# ONNX exports of the original 18 MB model (rebuild with: python src/export_onnx.py --quantize)
+models/mask_classifier.onnx
+models/mask_classifier_int8.onnx
+
 # Environment variables and secrets
 .env
 .env.*

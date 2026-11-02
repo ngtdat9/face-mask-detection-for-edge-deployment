@@ -1,6 +1,9 @@
 torch
 torchvision
-opencv-python
+opencv-python>=4.10,<5
+onnx
+onnxruntime
+onnxscript
 numpy
 matplotlib
 scikit-learn
