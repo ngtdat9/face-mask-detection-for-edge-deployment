@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import time
 import urllib.error
 import urllib.request
 from pathlib import Path
@@ -122,6 +123,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--debug", action="store_true",
                         help="Print per-frame face counts and draw "
                              "detection boxes even before classification.")
+    parser.add_argument("--backend", type=str, default="torch", choices=["torch", "onnx"],
+                        help="Classifier runtime: 'torch' loads --model_path; 'onnx' "
+                             "runs --onnx_path with ONNX Runtime on CPU, the same way "
+                             "an edge device would (default: torch).")
+    parser.add_argument("--onnx_path", type=str,
+                        default=str(PROJECT_ROOT / "models" / "mask_classifier_gap_int8.onnx"),
+                        help="Exported classifier used with --backend onnx.")
+    parser.add_argument("--threads", type=int, default=None,
+                        help="CPU threads for ONNX Runtime and OpenCV (default: library choice).")
     return parser.parse_args()
 
 
@@ -391,18 +401,78 @@ def draw_debug_box(
 # --------------------------------------------------------------------------- #
 #  Main loop                                                                  #
 # --------------------------------------------------------------------------- #
-def main() -> None:
-    args = parse_args()
+def build_classifier(args: argparse.Namespace):
+    """Return (classify_fn, idx_to_class).
+
+    classify_fn(frame, boxes) -> list of (box, class_index, confidence).
+    The classifier only ever sees faces the detector already found.
+    """
+    if args.backend == "onnx":
+        from edge_utils import OnnxClassifier, preprocess_bgr, softmax
+
+        onnx_path = Path(args.onnx_path)
+        if not onnx_path.is_file():
+            print(f"ERROR: ONNX model not found: {onnx_path}\n"
+                  "       Export one with `python src/export_onnx.py "
+                  "--model_path models/mask_classifier_gap.pth --quantize`.",
+                  file=sys.stderr)
+            raise SystemExit(1)
+        runner = OnnxClassifier(onnx_path, num_threads=args.threads)
+        print(f"Classifier: ONNX Runtime CPU, {onnx_path.name}")
+
+        def classify_onnx(frame, boxes):
+            fh, fw = frame.shape[:2]
+            crops, kept = [], []
+            for x, y, w, h in boxes:
+                x1, y1, x2, y2 = max(0, x), max(0, y), min(fw, x + w), min(fh, y + h)
+                if x2 > x1 and y2 > y1:
+                    crops.append(preprocess_bgr(frame[y1:y2, x1:x2], runner.image_size,
+                                                runner.mean, runner.std))
+                    kept.append((x, y, w, h))
+            if not crops:
+                return []
+            probs = softmax(runner(np.stack(crops)))
+            return [(box, int(p.argmax()), float(p.max())) for box, p in zip(kept, probs)]
+
+        return classify_onnx, {v: k for k, v in runner.class_to_idx.items()}
 
     device = select_device()
     print(f"Using device: {device}")
-
     # Load the trained classifier first so a missing checkpoint fails
     # fast, before we touch the camera or download the YuNet model.
     model, idx_to_class, image_size, mean, std = load_model_from_checkpoint(
         Path(args.model_path), device,
     )
-    print(f"Loaded checkpoint: {args.model_path}")
+    print(f"Classifier: PyTorch, {args.model_path}")
+    preprocess = build_preprocess(image_size, mean, std)
+
+    def classify_torch(frame, boxes):
+        tensors, kept = [], []
+        for box in boxes:
+            tensor = crop_to_tensor(frame, box, preprocess)
+            if tensor is not None:
+                tensors.append(tensor)
+                kept.append(box)
+        if not tensors:
+            return []
+        batch = torch.stack(tensors, dim=0).to(device)
+        with torch.no_grad():
+            # Softmax is applied here at inference time only -- never
+            # inside the model -- so training with CrossEntropyLoss
+            # stays numerically stable.
+            probabilities = F.softmax(model(batch), dim=1)
+            confidences, indices = torch.max(probabilities, dim=1)
+        return list(zip(kept, indices.cpu().tolist(), confidences.cpu().tolist()))
+
+    return classify_torch, idx_to_class
+
+
+def main() -> None:
+    args = parse_args()
+    if args.threads is not None:
+        cv2.setNumThreads(args.threads)
+
+    classify, idx_to_class = build_classifier(args)
     print(f"Classes: {idx_to_class}")
 
     # Build the face detector chosen by --detector.
@@ -411,8 +481,6 @@ def main() -> None:
     print(f"Face detector: {detector_name}")
     if args.debug:
         print("Debug mode: ON (per-frame face counts + raw detection boxes).")
-
-    preprocess = build_preprocess(image_size, mean, std)
 
     # Open the webcam. cv2.VideoCapture(0) is usually the default camera.
     cap = cv2.VideoCapture(args.camera)
@@ -430,6 +498,8 @@ def main() -> None:
     window_name = "Face Mask Detection (press q to quit)"
 
     frame_idx = 0
+    fps = 0.0
+    last_time = time.perf_counter()
     try:
         while True:
             ret, frame = cap.read()
@@ -454,38 +524,19 @@ def main() -> None:
                 for box in boxes:
                     draw_debug_box(frame, box)
 
-            # 2. Build a batch of preprocessed face tensors.
-            tensors: list[torch.Tensor] = []
-            valid_boxes: list[tuple[int, int, int, int]] = []
-            for box in boxes:
-                tensor = crop_to_tensor(frame, box, preprocess)
-                if tensor is not None:
-                    tensors.append(tensor)
-                    valid_boxes.append(box)
+            # 2. Crop, preprocess and classify all faces in one batch.
+            # 3. Draw one labeled bounding box per face. Boxes are
+            #    redrawn every frame, so they follow moving faces.
+            for box, idx, conf in classify(frame, boxes):
+                label = idx_to_class.get(int(idx), str(idx))
+                draw_label(frame, box, label, float(conf))
 
-            # 3. Classify -- one forward pass for all faces in this frame.
-            if tensors:
-                batch = torch.stack(tensors, dim=0).to(device)
-                with torch.no_grad():
-                    logits = model(batch)
-                    # Softmax converts logits into probabilities. We
-                    # apply it here at inference time only -- never
-                    # inside the model -- so training with
-                    # CrossEntropyLoss stays numerically stable.
-                    probabilities = F.softmax(logits, dim=1)
-                    confidence_values, predicted_indices = torch.max(
-                        probabilities, dim=1,
-                    )
-
-                # 4. Draw one labeled bounding box per face. Boxes are
-                #    redrawn every frame, so they follow moving faces.
-                for box, idx, conf in zip(
-                    valid_boxes,
-                    predicted_indices.cpu().tolist(),
-                    confidence_values.cpu().tolist(),
-                ):
-                    label = idx_to_class.get(int(idx), str(idx))
-                    draw_label(frame, box, label, float(conf))
+            now = time.perf_counter()
+            instant = 1.0 / max(now - last_time, 1e-6)
+            fps = instant if fps == 0.0 else 0.9 * fps + 0.1 * instant
+            last_time = now
+            cv2.putText(frame, f"FPS: {fps:.1f}", (10, 25), cv2.FONT_HERSHEY_SIMPLEX,
+                        0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
             cv2.imshow(window_name, frame)
             key = cv2.waitKey(1) & 0xFF
