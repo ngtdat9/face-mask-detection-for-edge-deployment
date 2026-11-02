@@ -47,24 +47,23 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
-from PIL import Image
-from torchvision import transforms
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# PyTorch is optional: `--backend onnx` needs only onnxruntime, OpenCV and
+# NumPy, which is what an edge device would install.
 try:
+    import torch
+    import torch.nn.functional as F
+    from PIL import Image
+    from torchvision import transforms
+
     from model import MaskCNN, build_model_from_checkpoint
-except ImportError:
-    sys.path.insert(0, str(Path(__file__).resolve().parent))
-    try:
-        from model import MaskCNN, build_model_from_checkpoint  # type: ignore[no-redef]
-    except ImportError as exc:
-        print(
-            "ERROR: could not import MaskCNN from src/model.py.\n"
-            "Run this script from the project root with `python src/live_camera.py`.",
-            file=sys.stderr,
-        )
-        raise SystemExit(1) from exc
+except ImportError as _torch_import_error:
+    torch = None
+    TORCH_IMPORT_ERROR = _torch_import_error
+else:
+    TORCH_IMPORT_ERROR = None
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -435,6 +434,11 @@ def build_classifier(args: argparse.Namespace):
             return [(box, int(p.argmax()), float(p.max())) for box, p in zip(kept, probs)]
 
         return classify_onnx, {v: k for k, v in runner.class_to_idx.items()}
+
+    if torch is None:
+        print(f"ERROR: --backend torch needs PyTorch ({TORCH_IMPORT_ERROR}).\n"
+              "       Install it, or use `--backend onnx`.", file=sys.stderr)
+        raise SystemExit(1)
 
     device = select_device()
     print(f"Using device: {device}")
