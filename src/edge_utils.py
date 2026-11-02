@@ -29,7 +29,11 @@ def preprocess_bgr(
 ) -> np.ndarray:
     """BGR uint8 face crop -> normalized float32 tensor of shape (3, H, W)."""
     rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
-    resized = cv2.resize(rgb, (image_size, image_size), interpolation=cv2.INTER_LINEAR)
+    # INTER_LINEAR aliases badly when shrinking large crops; INTER_AREA
+    # matches the antialiased PIL resize the model was trained with.
+    shrinking = max(rgb.shape[:2]) > image_size
+    interpolation = cv2.INTER_AREA if shrinking else cv2.INTER_LINEAR
+    resized = cv2.resize(rgb, (image_size, image_size), interpolation=interpolation)
     x = resized.astype(np.float32) / 255.0
     x = (x - np.asarray(mean, dtype=np.float32)) / np.asarray(std, dtype=np.float32)
     return np.ascontiguousarray(x.transpose(2, 0, 1))
@@ -97,6 +101,9 @@ class OnnxClassifier:
 
         options = ort.SessionOptions()
         options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
+        # By default idle worker threads busy-wait after each run, which
+        # starves the OpenCV face detector sharing the same CPU cores.
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
         if num_threads is not None:
             options.intra_op_num_threads = num_threads
             options.inter_op_num_threads = 1
