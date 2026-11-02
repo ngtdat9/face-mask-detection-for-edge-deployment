@@ -52,11 +52,11 @@ from PIL import Image
 from torchvision import transforms
 
 try:
-    from model import MaskCNN
+    from model import MaskCNN, build_model_from_checkpoint
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
-        from model import MaskCNN  # type: ignore[no-redef]
+        from model import MaskCNN, build_model_from_checkpoint  # type: ignore[no-redef]
     except ImportError as exc:
         print(
             "ERROR: could not import MaskCNN from src/model.py.\n"
@@ -170,7 +170,7 @@ def load_model_from_checkpoint(
     std = list(checkpoint.get("std", DEFAULT_STD))
     idx_to_class = {idx: name for name, idx in class_to_idx.items()}
 
-    model = MaskCNN(num_classes=len(class_to_idx)).to(device)
+    model = build_model_from_checkpoint(checkpoint).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 

@@ -35,11 +35,11 @@ from torchvision import transforms
 # `python src/predict_image.py` (from the project root) or as
 # `python predict_image.py` from inside `src/`.
 try:
-    from model import MaskCNN
+    from model import build_model_from_checkpoint
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
-        from model import MaskCNN  # type: ignore[no-redef]
+        from model import build_model_from_checkpoint  # type: ignore[no-redef]
     except ImportError as exc:
         print(
             "ERROR: could not import MaskCNN from src/model.py.\n"
@@ -162,7 +162,7 @@ def main() -> None:
 
     # ---- Build and load the model ----------------------------------------
     try:
-        model = MaskCNN(num_classes=len(class_to_idx)).to(device)
+        model = build_model_from_checkpoint(checkpoint).to(device)
         model.load_state_dict(checkpoint["model_state_dict"])
     except Exception as exc:
         print(f"ERROR: failed to load model weights: {exc}", file=sys.stderr)

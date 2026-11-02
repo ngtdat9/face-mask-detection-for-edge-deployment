@@ -43,11 +43,11 @@ from torchvision import transforms
 from torchvision.datasets import ImageFolder
 
 try:
-    from model import MaskCNN
+    from model import build_model_from_checkpoint
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
-        from model import MaskCNN  # type: ignore[no-redef]
+        from model import build_model_from_checkpoint  # type: ignore[no-redef]
     except ImportError as exc:
         print(
             "ERROR: could not import MaskCNN from src/model.py.\n"
@@ -85,6 +85,9 @@ def parse_args() -> argparse.Namespace:
                         help="Mini-batch size for evaluation (default: 32).")
     parser.add_argument("--num_workers", type=int, default=0,
                         help="DataLoader workers. Use 0 on macOS (default: 0).")
+    parser.add_argument("--output_prefix", type=str, default="",
+                        help="Prefix for output filenames, e.g. 'gap_' writes "
+                             "gap_confusion_matrix.png (default: no prefix).")
     return parser.parse_args()
 
 
@@ -295,8 +298,9 @@ def main() -> None:
     print(f"Test images: {len(test_dataset)}")
 
     # Build the model, load weights, move to device.
-    model = MaskCNN(num_classes=len(class_names)).to(device)
+    model = build_model_from_checkpoint(checkpoint).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
+    print(f"Model head: {model.head}  image size: {image_size}")
 
     # Collect predictions over the entire test set.
     y_true, y_pred = collect_predictions(model, test_loader, device)
@@ -326,7 +330,7 @@ def main() -> None:
 
     # Plots.
     cm = confusion_matrix(y_true, y_pred, labels=list(range(len(class_names))))
-    cm_path = results_dir / "confusion_matrix.png"
+    cm_path = results_dir / f"{args.output_prefix}confusion_matrix.png"
     save_confusion_matrix(cm, class_names, cm_path)
     print(f"Confusion matrix saved to    : {cm_path}")
 
@@ -334,7 +338,7 @@ def main() -> None:
         y_true, y_pred, target_names=class_names,
         output_dict=True, zero_division=0,
     )
-    report_path = results_dir / "classification_report.png"
+    report_path = results_dir / f"{args.output_prefix}classification_report.png"
     save_classification_report(report_dict, class_names, report_path)
     print(f"Classification report saved to: {report_path}")
 

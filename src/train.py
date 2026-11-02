@@ -38,11 +38,11 @@ except ImportError:  # pragma: no cover
 # We add an explicit fallback for safety in case the script is launched
 # from somewhere unusual.
 try:
-    from model import MaskCNN
+    from model import HEADS, MaskCNN, count_parameters
 except ImportError:
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     try:
-        from model import MaskCNN  # type: ignore[no-redef]
+        from model import HEADS, MaskCNN, count_parameters  # type: ignore[no-redef]
     except ImportError as exc:
         print(
             "ERROR: could not import MaskCNN from src/model.py.\n"
@@ -87,6 +87,17 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--results_dir", type=str,
                         default=str(PROJECT_ROOT / "results"),
                         help="Where to save loss / accuracy plots.")
+    parser.add_argument("--head", type=str, default="flatten", choices=list(HEADS),
+                        help="Classifier head: 'flatten' (original, ~4.6M params) "
+                             "or 'gap' (edge-friendly, ~0.39M params).")
+    parser.add_argument("--image_size", type=int, default=IMAGE_SIZE,
+                        help="Square input size (default: 128). The 'flatten' "
+                             "head only supports 128.")
+    parser.add_argument("--plot_prefix", type=str, default="",
+                        help="Prefix for plot filenames, e.g. 'gap_' writes "
+                             "gap_loss_plot.png (default: no prefix).")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for weight init and shuffling (default: 42).")
     return parser.parse_args()
 
 
@@ -105,7 +116,7 @@ def select_device() -> torch.device:
 # --------------------------------------------------------------------------- #
 #  Data wrappers                                                              #
 # --------------------------------------------------------------------------- #
-def build_transforms() -> tuple[transforms.Compose, transforms.Compose]:
+def build_transforms(image_size: int) -> tuple[transforms.Compose, transforms.Compose]:
     """Return (train_transform, val_transform).
 
     The train transform adds light data augmentation so the model sees a
@@ -118,7 +129,7 @@ def build_transforms() -> tuple[transforms.Compose, transforms.Compose]:
     classifier always sees images preprocessed in exactly the same way.
     """
     train_transform = transforms.Compose([
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.Resize((image_size, image_size)),
         transforms.RandomHorizontalFlip(),
         transforms.RandomRotation(degrees=10),
         transforms.ColorJitter(brightness=0.2, contrast=0.2),
@@ -127,7 +138,7 @@ def build_transforms() -> tuple[transforms.Compose, transforms.Compose]:
     ])
 
     val_transform = transforms.Compose([
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.Resize((image_size, image_size)),
         transforms.ToTensor(),
         transforms.Normalize(mean=NORM_MEAN, std=NORM_STD),
     ])
@@ -140,6 +151,7 @@ def build_dataloaders(
     val_dir: Path,
     batch_size: int,
     num_workers: int,
+    image_size: int,
 ) -> tuple[DataLoader, DataLoader, ImageFolder, ImageFolder]:
     """Wrap the train/val folders in ImageFolder + DataLoader.
 
@@ -157,7 +169,7 @@ def build_dataloaders(
               file=sys.stderr)
         raise SystemExit(1)
 
-    train_transform, val_transform = build_transforms()
+    train_transform, val_transform = build_transforms(image_size)
 
     train_dataset = ImageFolder(root=str(train_dir), transform=train_transform)
     val_dataset = ImageFolder(root=str(val_dir), transform=val_transform)
@@ -304,6 +316,13 @@ def main() -> None:
     model_path = Path(args.model_path)
     results_dir = Path(args.results_dir)
 
+    if args.head == "flatten" and args.image_size != 128:
+        print("ERROR: the 'flatten' head is wired for 128x128 inputs. "
+              "Use --head gap for other image sizes.", file=sys.stderr)
+        raise SystemExit(1)
+
+    torch.manual_seed(args.seed)
+
     # Make sure the output folders exist before we start training.
     model_path.parent.mkdir(parents=True, exist_ok=True)
     results_dir.mkdir(parents=True, exist_ok=True)
@@ -318,6 +337,7 @@ def main() -> None:
         val_dir=val_dir,
         batch_size=args.batch_size,
         num_workers=args.num_workers,
+        image_size=args.image_size,
     )
     print(f"Found classes: {train_dataset.class_to_idx}")
     print(f"Train images : {len(train_dataset)}")
@@ -326,7 +346,9 @@ def main() -> None:
     # Model + loss + optimizer.
     # CrossEntropyLoss expects raw logits, so the model must NOT apply
     # softmax in its forward method (and MaskCNN does not).
-    model = MaskCNN(num_classes=len(train_dataset.classes)).to(device)
+    model = MaskCNN(num_classes=len(train_dataset.classes), head=args.head).to(device)
+    print(f"Model head   : {args.head}  ({count_parameters(model):,} parameters)")
+    print(f"Image size   : {args.image_size}x{args.image_size}")
     criterion = nn.CrossEntropyLoss()
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
@@ -372,7 +394,8 @@ def main() -> None:
             checkpoint = {
                 "model_state_dict": model.state_dict(),
                 "class_to_idx": train_dataset.class_to_idx,
-                "image_size": IMAGE_SIZE,
+                "head": args.head,
+                "image_size": args.image_size,
                 "mean": NORM_MEAN,
                 "std": NORM_STD,
                 "best_val_accuracy": best_val_acc,
@@ -388,20 +411,22 @@ def main() -> None:
 
     # Save plots showing how training and validation evolved over epochs.
     epochs_x = list(range(1, args.epochs + 1))
+    loss_path = results_dir / f"{args.plot_prefix}loss_plot.png"
+    accuracy_path = results_dir / f"{args.plot_prefix}accuracy_plot.png"
     save_curve(
         epochs_x, train_losses, val_losses,
         title="Training and Validation Loss",
         ylabel="loss",
-        output_path=results_dir / "loss_plot.png",
+        output_path=loss_path,
     )
     save_curve(
         epochs_x, train_accuracies, val_accuracies,
         title="Training and Validation Accuracy",
         ylabel="accuracy",
-        output_path=results_dir / "accuracy_plot.png",
+        output_path=accuracy_path,
     )
-    print(f"Loss plot saved to    : {results_dir / 'loss_plot.png'}")
-    print(f"Accuracy plot saved to: {results_dir / 'accuracy_plot.png'}")
+    print(f"Loss plot saved to    : {loss_path}")
+    print(f"Accuracy plot saved to: {accuracy_path}")
 
 
 if __name__ == "__main__":
